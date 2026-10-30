@@ -1,0 +1,79 @@
+# Configure a GitHub push trigger to use this file. Nothing runs until invoked.
+steps:
+  - id: validate-and-test
+    name: python:3.13-slim
+    entrypoint: bash
+    env:
+      - 'DEPLOY_PROJECT=$PROJECT_ID'
+      - 'DEPLOY_REGION=${_REGION}'
+      - 'AR_REPOSITORY=${_AR_REPOSITORY}'
+      - 'INSTANCE_CONNECTION_NAME=${_INSTANCE_CONNECTION_NAME}'
+      - 'DATABASE_NAME=${_DB_NAME}'
+      - 'DATABASE_USER=${_DB_USER}'
+      - 'PASSWORD_VERSION=${_DB_PASSWORD_VERSION}'
+      - 'HMAC_VERSION=${_WEBHOOK_SECRET_VERSION}'
+      # Do not use ambient database credentials in the test step.
+      - 'TEST_DATABASE_DSN='
+    args:
+      - -ceu
+      - |
+        test "$$DEPLOY_PROJECT" = gen-lang-client-0786534718
+        for required in DEPLOY_REGION AR_REPOSITORY INSTANCE_CONNECTION_NAME DATABASE_NAME DATABASE_USER PASSWORD_VERSION HMAC_VERSION; do
+          if [ -z "$${!required}" ]; then
+            echo "Missing Cloud Build substitution: $$required" >&2
+            exit 1
+          fi
+        done
+        for version in "$$PASSWORD_VERSION" "$$HMAC_VERSION"; do
+          case "$$version" in
+            *[!0-9]*|0) echo 'Secret versions must be positive numeric versions' >&2; exit 1 ;;
+          esac
+        done
+        pip install --no-cache-dir -r requirements-dev.txt
+        python -m pytest -q -m 'not integration'
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args: ['build', '-t', '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPOSITORY}/wordpress-webhook:$BUILD_ID', '.']
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args: ['push', '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPOSITORY}/wordpress-webhook:$BUILD_ID']
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - wordpress-webhook
+      - --project=$PROJECT_ID
+      - --region=${_REGION}
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPOSITORY}/wordpress-webhook:$BUILD_ID
+      - --service-account=wordpress-webhook@$PROJECT_ID.iam.gserviceaccount.com
+      - --execution-environment=gen2
+      - --add-cloudsql-instances=${_INSTANCE_CONNECTION_NAME}
+      - --set-env-vars=DB_HOST=/cloudsql/${_INSTANCE_CONNECTION_NAME},DB_PORT=5432,DB_NAME=${_DB_NAME},DB_USER=${_DB_USER},DB_SSLMODE=disable,DB_POOL_MAX_SIZE=5
+      - --set-secrets=DB_PASSWORD=${_DB_PASSWORD_SECRET}:${_DB_PASSWORD_VERSION},WEBHOOK_SECRET=${_WEBHOOK_SECRET_NAME}:${_WEBHOOK_SECRET_VERSION}
+      - --allow-unauthenticated
+      - --ingress=all
+      - --port=8080
+      - --concurrency=20
+      - --max-instances=3
+      - --min-instances=0
+      - --cpu=1
+      - --memory=512Mi
+      - --timeout=30s
+      - --quiet
+images:
+  - '${_REGION}-docker.pkg.dev/$PROJECT_ID/${_AR_REPOSITORY}/wordpress-webhook:$BUILD_ID'
+substitutions:
+  _REGION: ''
+  _AR_REPOSITORY: ''
+  _INSTANCE_CONNECTION_NAME: ''
+  _DB_NAME: ''
+  _DB_USER: ''
+  _DB_PASSWORD_SECRET: wordpress-webhook-db-password
+  _DB_PASSWORD_VERSION: ''
+  _WEBHOOK_SECRET_NAME: wordpress-webhook-hmac
+  _WEBHOOK_SECRET_VERSION: ''
+options:
+  logging: CLOUD_LOGGING_ONLY
+timeout: 1200s
